@@ -5,10 +5,12 @@ Addressing this need, we present Unitxt, an innovative library for customizable 
 """
 
 import importlib.util
+import re
 from functools import partial
 from typing import Any, Dict, Optional
 
 import datasets
+import evaluate
 
 from lm_eval.api.instance import Instance
 from lm_eval.api.task import ConfigurableTask
@@ -25,19 +27,17 @@ _CITATION = """
 }
 """
 
+
 def is_unitxt_installed() -> bool:
     return importlib.util.find_spec("unitxt") is not None
 
+
 def score(items, metric):
     predictions, references = zip(*items)
-    if is_unitxt_installed():
-        from unitxt import evaluate
-        for reference in references:
-            reference["metrics"] = [metric]
-        results = evaluate(predictions,references)
-    else:
-        raise Exception("Please install unitxt via 'pip install unitxt'. For more information see: https://www.unitxt.ai/")
-
+    evaluator = evaluate.load("unitxt/metric")
+    for reference in references:
+        reference["metrics"] = [metric]
+    results = evaluator.compute(predictions=predictions, references=references)
     return results[0]["score"]["global"]["score"]
 
 
@@ -66,7 +66,11 @@ class Unitxt(ConfigurableTask):
 
             self.dataset = load_dataset(self.DATASET_NAME)
         else:
-            raise Exception("Please install unitxt via 'pip install unitxt'. For more information see: https://www.unitxt.ai/")
+            self.dataset = datasets.load_dataset(
+                name=self.DATASET_NAME,
+                path="unitxt/data",
+                trust_remote_code=True,
+            )
 
     def has_training_docs(self):
         return "train" in self.dataset
@@ -95,6 +99,9 @@ class Unitxt(ConfigurableTask):
     def doc_to_target(self, doc):
         doc["target"]
 
+    def get_arguments(self, doc, ctx):
+        return (ctx, {"until": ["\n"]})
+
     def construct_requests(self, doc, ctx, **kwargs):
         """Uses RequestFactory to construct Requests and returns an iterable of
         Requests which will be sent to the LM.
@@ -106,12 +113,11 @@ class Unitxt(ConfigurableTask):
             language description, as well as the few shot examples, and the question
             part of the document for `doc`.
         """
-
         return [
             Instance(
                 request_type="generate_until",
                 doc=doc,
-                arguments=(ctx, {"until": ["\n"]}),
+                arguments=self.get_arguments(doc, ctx),
                 idx=0,
                 **kwargs,
             )
@@ -156,3 +162,34 @@ class Unitxt(ConfigurableTask):
             whether a higher value of the submetric is better
         """
         return {metric.replace("metrics.", ""): True for metric in self.metrics}
+
+
+images_regex = r'<img\s+src=["\'](.*?)["\']\s*/?>'
+image_source_regex = r'<img\s+src=["\'](.*?)["\']'
+
+
+def extract_images(text, instance):
+    image_sources = re.findall(image_source_regex, text)
+    images = []
+    for image_source in image_sources:
+        current = instance
+        for key in image_source.split("/"):
+            if key.isdigit():
+                key = int(key)
+            current = current[key]
+        images.append(current)
+    return images
+
+
+class UnitxtMultiModal(Unitxt):
+    MULTIMODAL = True
+
+    def doc_to_text(self, doc):
+        return re.sub(images_regex, "<image>", doc["source"])
+
+    def doc_to_image(self, doc):
+        images = extract_images(doc["source"], doc)
+        return [self.image_decoder.decode_example(image) for image in images]
+
+    def get_arguments(self, doc, ctx):
+        return (ctx, {"until": ["\n"]}, {"visual": self.doc_to_image(doc)})

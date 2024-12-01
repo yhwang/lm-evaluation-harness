@@ -260,7 +260,12 @@ class WatsonxLLM(LM):
         ):
             context, continuation = request
             try:
-                response = self.model.generate_text(context, self.generate_params)
+                if isinstance(context, JsonChatStr):
+                    context = json.loads(context.prompt)
+                    response = self.model.chat(context, self.generate_params)
+                    response = response["choices"][0]["message"]["content"]
+                else:
+                    response = self.model.generate_text(context, self.generate_params)
             except Exception as exp:
                 eval_logger.error("Error while generating text.")
                 raise exp
